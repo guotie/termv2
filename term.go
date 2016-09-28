@@ -109,8 +109,8 @@ func StartTermServer(addr string, port, maxClient int) (*TermServer, error) {
 }
 
 func (srv *TermServer) Stop() {
-	srv.termLn.Close()
 	srv.ch <- struct{}{}
+	srv.termLn.Close()
 }
 
 func (srv *TermServer) TermRoutine() {
