@@ -1,12 +1,10 @@
-package term
+package termv2
 
 import (
 	"fmt"
 	"net"
 	"strings"
-	"sync"
 
-	//"github.com/guotie/deferinit"
 	"github.com/smtc/glog"
 	"github.com/ziutek/telnet"
 	//"strings"
@@ -65,59 +63,79 @@ type ConsoleCmd struct {
 	fn         TermFunc
 }
 
-var (
-	termLn      net.Listener
-	_           = fmt.Sprint
-	_           = telnet.NewConn
-	termHandler = make(map[string]ConsoleCmd)
-	lastCmd     *ConsoleCmd
-	lastArgv    []string
-	history     = cmdHistory{}
-)
+// terminal client
+type TermClient struct {
+	conn     *telnet.Conn
+	lastCmd  *ConsoleCmd
+	server   *TermServer
+	history  cmdHistory
+	lastArgv []string
+}
+
+// terminal server
+type TermServer struct {
+	ch        chan struct{}
+	maxClient int
+	port      int
+	addr      string
+	termLn    net.Listener
+
+	Handlers map[string]*ConsoleCmd
+}
 
 func init() {
 	//deferinit.AddInit(startTermServer, stopTermServer, 1)
 	//deferinit.AddRoutine(termRoutine)
 }
 
-func StartTermServer(port int) {
+func StartTermServer(addr string, port, maxClient int) (*TermServer, error) {
 	var err error
 
-	termLn, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	srv := &TermServer{
+		addr:      addr,
+		port:      port,
+		maxClient: maxClient,
+		ch:        make(chan struct{}, 0),
+		Handlers:  map[string]*ConsoleCmd{},
+	}
+
+	srv.termLn, err = net.Listen("tcp", fmt.Sprintf("%s:%d", addr, port))
 	if err != nil {
-		panic("start term server failed: " + err.Error())
+		return nil, err
 	}
 
 	glog.Info("start terminal server successfully.\n")
+	return srv, nil
 }
 
-func StopTermServer() {
-	termLn.Close()
+func (srv *TermServer) Stop() {
+	srv.termLn.Close()
+	srv.ch <- struct{}{}
 }
 
-func TermRoutine(ch chan struct{}, wg *sync.WaitGroup) {
-	running := true
+func (srv *TermServer) TermRoutine() {
 	go func() {
-		<-ch
-
 		// 关闭所有connection
-		running = false
-		wg.Done()
+		<-srv.ch
 	}()
 
-	for running {
-		conn, err := termLn.Accept()
+	for {
+		conn, err := srv.termLn.Accept()
 		if err != nil {
 			glog.Error("term server accept failed: %s\n", err.Error())
 			continue
 		}
 		tconn, _ := telnet.NewConn(conn)
-		_ = tconn
+		client := &TermClient{
+			conn:    tconn,
+			history: cmdHistory{},
+			server:  srv,
+		}
 		conn.Write([]byte{TELCODE_IAC, TELCODE_WILL, TELOPT_SGA})
 		conn.Write([]byte{TELCODE_IAC, TELCODE_WILL, TELOPT_ECHO})
 		//tconn.SetEcho(false)
 		//tconn.Write([]byte{TELCODE_IAC, TELCODE_DONT, TELOPT_ECHO})
-		go handleTermConn(conn)
+		go client.handleTermConn()
 	}
 }
 
@@ -126,8 +144,8 @@ func TermRoutine(ch chan struct{}, wg *sync.WaitGroup) {
 // minParams: 最少参数个数
 // repeat:    再不输入任何字符时，命令是否可以重复执行
 // fn:        该命令的执行函数
-func RegisterTermCmd(cmd string, maxParams, minParams int, repeat bool, fn TermFunc) {
-	termHandler[cmd] = ConsoleCmd{maxParams, minParams, repeat, fn}
+func (srv *TermServer) RegisterTermCmd(cmd string, maxParams, minParams int, repeat bool, fn TermFunc) {
+	srv.Handlers[cmd] = &ConsoleCmd{maxParams, minParams, repeat, fn}
 }
 
 // 将buff按照空格split, 引号中间的不分割
@@ -178,13 +196,13 @@ func splitBuff(cmd string) []string {
 	return argv
 }
 
-func handleTermConn(conn net.Conn) {
+func (client *TermClient) handleTermConn() {
 	var (
 		err error
 		cmd string
 	)
 
-	tcpconn := conn.(*net.TCPConn)
+	tcpconn := client.conn.Conn
 
 	for {
 		_, err = tcpconn.Write([]byte("->"))
@@ -192,20 +210,20 @@ func handleTermConn(conn net.Conn) {
 			break
 		}
 
-		cmd, err = parseInput(tcpconn)
+		cmd, err = client.parseInput()
 		if err != nil {
 			break
 		}
 
-		handleTermCmd(tcpconn, cmd)
-
+		client.server.HandleTermCmd(client, cmd)
 	}
+
 	tcpconn.Close()
 }
 
 // 控制客户端删除输入的字符
 // 先后退， 再打印空格，再后退
-func backspace(conn *net.TCPConn, n int) {
+func backspace(conn net.Conn, n int) {
 	bck := []byte{TELANSI_ESC, byte('[')}
 	bck = append(bck, []byte(fmt.Sprintf("%d", n))...)
 	bck = append(bck, TELKEY_LEFT)
@@ -217,7 +235,7 @@ func backspace(conn *net.TCPConn, n int) {
 }
 
 // 解析用户输入
-func parseInput(conn *net.TCPConn) (cmd string, err error) {
+func (client *TermClient) parseInput() (cmd string, err error) {
 	var (
 		//n       int
 		ch, ch2 byte
@@ -225,6 +243,9 @@ func parseInput(conn *net.TCPConn) (cmd string, err error) {
 		buflen  int
 		ccmd    string
 		buf     = make([]byte, 1024)
+
+		history = &client.history
+		conn    = client.conn
 	)
 
 	for buflen < 1000 {
@@ -259,9 +280,9 @@ func parseInput(conn *net.TCPConn) (cmd string, err error) {
 			buflen++
 			switch ch2 {
 			case TELKEY_UP:
-				ccmd = getHistoryCmd(TELKEY_UP)
+				ccmd = client.getHistoryCmd(TELKEY_UP)
 			case TELKEY_DOWN:
-				ccmd = getHistoryCmd(TELKEY_DOWN)
+				ccmd = client.getHistoryCmd(TELKEY_DOWN)
 
 			default:
 				// 左右键不处理
@@ -304,7 +325,7 @@ func parseInput(conn *net.TCPConn) (cmd string, err error) {
 	}
 out:
 	if repeat == false {
-		setHistoryCmd(cmd)
+		client.setHistoryCmd(cmd)
 	} else {
 		if history.used > 0 {
 			history.index = history.pindex
@@ -314,10 +335,11 @@ out:
 }
 
 // 历史命令
-func setHistoryCmd(cmd string) {
+func (client *TermClient) setHistoryCmd(cmd string) {
 	if strings.TrimSpace(cmd) == "" {
 		return
 	}
+	history := &client.history
 	if history.used >= MaxHistroyCmds {
 		history.used = MaxHistroyCmds
 	}
@@ -331,15 +353,21 @@ func setHistoryCmd(cmd string) {
 	history.used++
 }
 
+//
 // 调试函数，打印history command
-func printHistoryCmd() {
+func (client *TermClient) printHistoryCmd() {
+	history := &client.history
+
 	fmt.Printf("History index: %d pindex: %d used: %d\n",
 		history.index, history.pindex, history.used)
 	fmt.Printf("commands: %v\n", history.cmds[0:MaxHistroyCmds])
 }
 
+//
 // 获取历史命令
-func getHistoryCmd(key byte) string {
+func (client *TermClient) getHistoryCmd(key byte) string {
+	history := &client.history
+
 	if key == TELKEY_UP {
 		history.index--
 		if history.index < 0 {
@@ -359,15 +387,18 @@ func getHistoryCmd(key byte) string {
 }
 
 // 处理telnet 连接命令
-func handleTermCmd(c *net.TCPConn, cmd string) error {
+func (srv *TermServer) HandleTermCmd(client *TermClient, cmd string) error {
 	argv := splitBuff(cmd)
 	//fmt.Println(argv)
 	if len(argv) == 0 {
 		return nil
 	}
+	c := client.conn
+	lastCmd := client.lastCmd
+
 	if argv[0] == "" {
 		if lastCmd != nil {
-			res, err := lastCmd.fn(lastArgv)
+			res, err := lastCmd.fn(client.lastArgv)
 			c.Write([]byte(res))
 			c.Write([]byte("\r\n"))
 			return err
@@ -380,7 +411,7 @@ func handleTermCmd(c *net.TCPConn, cmd string) error {
 		return nil
 	}
 
-	console, ok := termHandler[argv[0]]
+	console, ok := srv.Handlers[argv[0]]
 	if !ok {
 		c.Write([]byte(fmt.Sprintf("Not found term command %s\r\n", argv[0])))
 		return nil
@@ -394,8 +425,8 @@ func handleTermCmd(c *net.TCPConn, cmd string) error {
 	}
 
 	if console.repeatable {
-		lastCmd = &console
-		lastArgv = argv
+		lastCmd = console
+		client.lastArgv = argv
 	} else {
 		lastCmd = nil
 	}
@@ -405,4 +436,28 @@ func handleTermCmd(c *net.TCPConn, cmd string) error {
 	c.Write([]byte("\r\n"))
 
 	return err
+}
+
+//
+// run command
+// 其他途径执行term server的命令，例如输出给 http
+func (srv *TermServer) RunCommand(cmd string) string {
+	argv := splitBuff(cmd)
+	if len(argv) == 0 {
+		return "empty command\r\n"
+	}
+
+	console, ok := srv.Handlers[argv[0]]
+	if !ok {
+		return fmt.Sprintf("Not found command %s\r\n", argv[0])
+	}
+
+	// 检查参数个数是否合法
+	if len(argv) < console.minParams || len(argv) > console.maxParams {
+		return fmt.Sprintf("Params of command %s should be %d - %d\r\n",
+			argv[0], console.minParams, console.maxParams)
+	}
+
+	res, _ := console.fn(argv)
+	return res
 }
