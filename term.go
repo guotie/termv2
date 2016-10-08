@@ -4,17 +4,15 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/smtc/glog"
 	"github.com/ziutek/telnet"
-	//"strings"
 )
 
 const (
 	bspace = byte(' ')
 	bcomma = byte('"')
-
-	termPort = 6789
 
 	CR = byte(13)
 	LF = byte(10)
@@ -123,6 +121,7 @@ func (srv *TermServer) TermRoutine() {
 		conn, err := srv.termLn.Accept()
 		if err != nil {
 			glog.Error("term server accept failed: %s\n", err.Error())
+			time.Sleep(time.Second)
 			continue
 		}
 		tconn, _ := telnet.NewConn(conn)
